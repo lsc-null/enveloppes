@@ -194,6 +194,9 @@ const parseMoney = s => { const v = parseFloat(String(s).replace(/\s/g,"").repla
 const todayKey = () => { const d=new Date(); return `${d.getFullYear()}-${pad(d.getMonth()+1)}`; };
 const prevKey = k => { let [y,m]=k.split("-").map(Number); m--; if(m<1){m=12;y--;} return `${y}-${pad(m)}`; };
 const nextKey = k => { let [y,m]=k.split("-").map(Number); m++; if(m>12){m=1;y++;} return `${y}-${pad(m)}`; };
+const isoToday = () => { const d=new Date(); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; };
+const addDays = (iso,n) => { const d=new Date(iso+"T12:00:00Z"); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); };
+const fmtDay = iso => { const [,m,d]=iso.split("-").map(Number); return `${d} ${MOIS_C[m-1]}`; };
 const labelKey = k => { const [y,m]=k.split("-").map(Number); return `${MOIS[m-1]} ${y}`; };
 const sum = a => a.reduce((s,v)=>s+(+v||0),0);
 const colorOf = env => env.color && env.color.startsWith("#") ? env.color : `var(${env.color||"--c8"})`;
@@ -268,6 +271,33 @@ function getMonth(k){ return S.months[k] || snapshot(S); }
 function ensureMonth(k){ if(!S.months[k]) S.months[k] = snapshot(S); return S.months[k]; }
 const envs = () => S.settings.envelopes;
 
+/* Période d'un mois budgétaire : du début du mois k à la veille du début du mois suivant.
+   Jour habituel ≥ 15 → le mois commence dans le mois civil précédent (27 → novembre commence le 27 octobre).
+   Jour habituel 2 à 14 → le mois commence ce jour-là dans le même mois civil. 1 → mois calendaire. */
+function defaultStart(k){
+  const d = Math.round(+(S.settings.startDay||1));
+  if(d<=1) return `${k}-01`;
+  const base = d>=15 ? prevKey(k) : k;
+  const [y,m] = base.split("-").map(Number); const dim = new Date(y,m,0).getDate();
+  return `${base}-${pad(Math.min(d,dim))}`;
+}
+function periodStart(k){ const m=S.months[k]; return (m && m.startDate) || defaultStart(k); }
+function periodEnd(k){ return addDays(periodStart(nextKey(k)),-1); }
+function periodOf(iso){
+  const k0 = iso.slice(0,7);
+  for(const c of [prevKey(k0),k0,nextKey(k0),nextKey(nextKey(k0))]){
+    if(periodStart(c)<=iso && iso<periodStart(nextKey(c))) return c;
+  }
+  return k0;
+}
+const curPeriod = () => periodOf(isoToday());
+function rebalance(){ // range chaque opération dans le mois budgétaire qui contient sa date
+  const all=[]; Object.values(S.months).forEach(m=>{ all.push(...m.tx); m.tx=[]; });
+  all.forEach(t=>ensureMonth(periodOf(t.date)).tx.push(t));
+  Object.values(S.months).forEach(m=>m.tx.sort((a,b)=>a.date.localeCompare(b.date)));
+  memo={};
+}
+
 let memo = {};
 function calc(k){
   if(memo[k]) return memo[k];
@@ -320,8 +350,9 @@ function render(){
 
 /* ---------- Vue mois ---------- */
 function renderMonth(){
-  const now = todayKey();
+  const now = curPeriod();
   if(cur<=now) ensureMonth(cur);
+  const pS = periodStart(cur), pE = periodEnd(cur);
   const m = getMonth(cur), c = calc(cur);
   $("#top").innerHTML = `<button class="nav-btn" data-act="prev" aria-label="Mois précédent">‹</button>
     <h1>${labelKey(cur).replace(/^./,ch=>ch.toUpperCase())}</h1>
@@ -332,7 +363,10 @@ function renderMonth(){
   let html = `<section class="summary">
     <div class="big"><div><div class="label">Solde actuel</div><div class="value num">${eur(c.current)}</div></div>
       <div class="side"><div class="label">Fin de mois prévue</div><div class="value num">${eur(c.forecast)}</div></div></div>
+    <p class="hint num" style="margin:0">Du ${fmtDay(pS)} au ${fmtDay(pE)}${m.startDate?" · début ajusté":""}</p>
     <dl class="rows num">
+      <dt><label for="pstart-in">Début du mois (jour de paie)</label></dt>
+      <dd><input type="date" id="pstart-in" value="${pS}" style="width:150px"></dd>
       <dt>Solde début de mois${c.startKnown?"":" <span class=\"pill warn\">à saisir</span>"}</dt>
       <dd><div class="start-edit"><input class="money" type="text" inputmode="decimal" id="start-in" value="${m.startManual!=null&&m.startManual!==""?String(m.startManual).replace(".",","):""}" placeholder="${c.startKnown?eur(c.start):"0,00 €"}" aria-label="Solde début de mois"></div></dd>
       <dt>Rentrées</dt><dd>+ ${eur(c.inc)}</dd>
@@ -391,10 +425,8 @@ function closeSheet(){ $("#modal").innerHTML = ""; }
 
 let draft = null;
 function openAdd(envId){
-  const now = new Date(); const tk = todayKey();
-  let date;
-  if(cur===tk) date = `${tk}-${pad(now.getDate())}`;
-  else { const [y,m]=cur.split("-").map(Number); const dim=new Date(y,m,0).getDate(); date = `${cur}-${pad(Math.min(now.getDate(),dim))}`; }
+  const today = isoToday(), s = periodStart(cur), e = periodEnd(cur);
+  const date = today<s ? s : (today>e ? e : today);
   const first = envs().find(e=>e.type!=="epargne") || envs()[0];
   draft = {env: envId || (first&&first.id), date, kind:"out"};
   drawAdd();
@@ -422,12 +454,13 @@ function saveTx(){
   const e = envs().find(x=>x.id===draft.env);
   amt = Math.abs(amt);
   if(e.type==="epargne" || draft.kind==="in") amt = -amt;
-  const k = draft.date.slice(0,7);
+  const k = periodOf(draft.date);
   const m = ensureMonth(k);
   m.tx.push({id:uid(),date:draft.date,env:draft.env,amount:amt,label:(draft.label||"").trim()});
   m.tx.sort((a,b)=>a.date.localeCompare(b.date));
+  const moved = k!==cur;
   save(); closeSheet(); cur = k; render();
-  toast(e.type==="epargne"?"Retrait enregistré":"Dépense enregistrée");
+  toast((e.type==="epargne"?"Retrait enregistré":"Dépense enregistrée")+(moved?` dans ${labelKey(k)}`:""));
 }
 function openEnv(id){
   const e = envs().find(x=>x.id===id); const m = getMonth(cur);
@@ -452,7 +485,7 @@ function delTx(id, btn){
 function renderYear(){
   const keys = Object.keys(S.months);
   const years = [...new Set(keys.map(k=>+k.slice(0,4)))];
-  const minY = Math.min(year, ...years), maxY = Math.max(+todayKey().slice(0,4), ...years);
+  const minY = Math.min(year, ...years), maxY = Math.max(+curPeriod().slice(0,4), ...years);
   $("#top").innerHTML = `<button class="nav-btn" data-act="yprev" aria-label="Année précédente" ${year<=minY?"disabled":""}>‹</button>
     <h1>Bilan ${year}</h1><button class="nav-btn" data-act="ynext" aria-label="Année suivante" ${year>=maxY?"disabled":""}>›</button>`;
   const mk = Array.from({length:12},(_,i)=>`${year}-${pad(i+1)}`);
@@ -566,6 +599,12 @@ function renderSettings(){
       <button class="x" data-del-item="${kind}" data-id="${i.id}" aria-label="Supprimer">✕</button></div>`;
   $("#view").innerHTML = `
   <p class="hint">Montants mensuels par défaut. Une modification s'applique au mois en cours et aux mois suivants, jamais aux mois passés.</p>
+  <h2>Début des mois</h2><div class="card" style="display:grid;gap:10px">
+    <div class="field-row"><label for="startday-in">Jour habituel du salaire</label><input class="num" type="number" inputmode="numeric" min="1" max="31" id="startday-in" value="${st.startDay||1}"></div>
+    <p class="hint">${(st.startDay||1)<=1?"Les mois suivent le calendrier, du 1er au dernier jour."
+      :(st.startDay>=15?`Novembre commence le ${st.startDay} octobre, décembre le ${st.startDay} novembre, etc.`:`Novembre commence le ${st.startDay} novembre, décembre le ${st.startDay} décembre, etc.`)}
+      Si ton salaire arrive plus tôt ou plus tard, ajuste la date du mois concerné dans l'écran Enveloppes.</p>
+  </div>
   <h2>Rentrées d'argent</h2><div class="card" style="display:grid;gap:10px">${st.incomes.map(i=>listItem("incomes",i)).join("")}
     <button class="btn small" data-add="incomes">+ Ajouter une rentrée</button></div>
   <h2>Charges fixes</h2><div class="card" style="display:grid;gap:10px">${st.fixed.map(i=>listItem("fixed",i)).join("")}
@@ -593,7 +632,7 @@ function renderSettings(){
       <button class="btn danger" data-act="reset">${pendingReset?"Confirmer : tout effacer":"Tout effacer"}</button></div>
   </div>`;
 }
-function applyForward(fn){ const now=todayKey(); Object.keys(S.months).forEach(k=>{ if(k>=now) fn(S.months[k]); }); }
+function applyForward(fn){ const now=curPeriod(); Object.keys(S.months).forEach(k=>{ if(k>=now) fn(S.months[k]); }); }
 
 /* ---------- Événements ---------- */
 document.addEventListener("click", ev => {
@@ -626,15 +665,31 @@ document.addEventListener("click", ev => {
   else if(a==="close-scrim"){ if(ev.target===t) closeSheet(); }
   else if(a==="save-tx") saveTx();
   else if(a==="add-in"){ openAdd(t.dataset.envId); }
-  else if(a==="clear-demo"){ const keep=S.settings; S=defaults(); S.settings.incomes=keep.incomes.map(i=>({...i,amount:0})); save(); cur=todayKey(); tab="reglages"; render(); toast("Données effacées. Commence par tes montants."); }
+  else if(a==="clear-demo"){ const keep=S.settings; S=defaults(); S.settings.incomes=keep.incomes.map(i=>({...i,amount:0})); S.settings.startDay=keep.startDay||1; save(); cur=curPeriod(); tab="reglages"; render(); toast("Données effacées. Commence par tes montants."); }
   else if(a==="export-file"){ try{ const blob=new Blob([JSON.stringify(S,null,1)],{type:"application/json"}); const u=URL.createObjectURL(blob); const l=document.createElement("a"); l.href=u; l.download=`enveloppes-${new Date().toISOString().slice(0,10)}.json`; document.body.appendChild(l); l.click(); l.remove(); setTimeout(()=>URL.revokeObjectURL(u),2000); toast("Fichier enregistré dans Téléchargements"); } catch(e){ toast("Téléchargement impossible ici, utilise « Copier »"); } }
   else if(a==="export-copy"){ const txt=JSON.stringify(S); const io=$("#io"); io.value=txt;
     (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>toast("Données copiées"),()=>{ io.select(); toast("Texte sélectionné : copie-le manuellement"); }); }
   else if(a==="import-text") importData($("#io").value);
-  else if(a==="reset"){ if(!pendingReset){ pendingReset=true; render(); return; } pendingReset=false; S=defaults(); save(); cur=todayKey(); render(); toast("Tout a été effacé"); }
+  else if(a==="reset"){ if(!pendingReset){ pendingReset=true; render(); return; } pendingReset=false; S=defaults(); save(); cur=curPeriod(); render(); toast("Tout a été effacé"); }
 });
 document.addEventListener("change", ev => {
   const t = ev.target;
+  if(t.id==="pstart-in"){
+    const v=t.value, m=ensureMonth(cur);
+    if(!v){ m.startDate=null; }
+    else {
+      const def=defaultStart(cur);
+      const a1=addDays(periodStart(prevKey(cur)),1), a2=addDays(def,-10); const lo = a1>a2?a1:a2;
+      const b1=addDays(periodStart(nextKey(cur)),-1), b2=addDays(def,10); const hi = b1<b2?b1:b2;
+      if(!(v>=lo && v<=hi)){ toast(`Choisis une date entre le ${fmtDay(lo)} et le ${fmtDay(hi)}`); render(); return; }
+      m.startDate = v===defaultStart(cur) ? null : v;
+    }
+    rebalance(); save(); render(); toast(`${labelKey(cur).replace(/^./,ch=>ch.toUpperCase())} commence le ${fmtDay(periodStart(cur))}`); return; }
+  if(t.id==="startday-in"){
+    const d=Math.round(+t.value);
+    if(!(d>=1 && d<=31)){ toast("Indique un jour entre 1 et 31"); render(); return; }
+    S.settings.startDay=d; Object.values(S.months).forEach(m=>m.startDate=null);
+    rebalance(); save(); cur=curPeriod(); render(); toast("Début des mois mis à jour"); return; }
   if(t.id==="start-in"){ const m=ensureMonth(cur); m.startManual = t.value.trim()===""?null:parseMoney(t.value); save(); render(); return; }
   if(t.id && t.id.startsWith("m-")){ const [, kind, ...rest]=t.id.split("-"); const id=rest.join("-"); const m=ensureMonth(cur);
     const map={inc:"incomes",fix:"fixed",alloc:"alloc"}; m[map[kind]][id]=parseMoney(t.value); openParams=true; save(); render(); openParams=false; return; }
@@ -649,7 +704,7 @@ document.addEventListener("change", ev => {
 });
 function importData(txt){
   try{ const d=JSON.parse(txt); if(!d || !d.settings || !d.months || !Array.isArray(d.settings.envelopes)) throw 0;
-    S=d; save(); cur=todayKey(); render(); toast("Sauvegarde restaurée"); }
+    S=d; save(); cur=curPeriod(); year=+cur.slice(0,4); render(); toast("Sauvegarde restaurée"); }
   catch(e){ toast("Ce texte n'est pas une sauvegarde valide"); }
 }
 $("#fab").addEventListener("click", ()=>openAdd());
@@ -659,8 +714,8 @@ let toastT;
 function toast(msg){ let el=$(".toast"); if(!el){ el=document.createElement("div"); el.className="toast"; el.setAttribute("role","status"); document.body.appendChild(el); }
   el.textContent=msg; el.hidden=false; clearTimeout(toastT); toastT=setTimeout(()=>el.hidden=true,2600); }
 
-load(); render();
-window.__env = {calc, savingsAt, getS:()=>S, setCur:k=>{cur=k;memo={};}};
+load(); cur = curPeriod(); year = +cur.slice(0,4); render();
+window.__env = {calc, savingsAt, periodOf, periodStart, periodEnd, getS:()=>S, setCur:k=>{cur=k;memo={};}};
 })();
 </script>
 
